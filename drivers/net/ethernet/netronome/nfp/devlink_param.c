@@ -9,6 +9,7 @@
 #include "nfpcore/nfp_nsp.h"
 #include "nfp_main.h"
 
+
 /**
  * struct nfp_devlink_param_u8_arg - Devlink u8 parameter get/set arguments
  * @hwinfo_name:	HWinfo key name
@@ -197,6 +198,151 @@ nfp_devlink_param_u8_validate(struct devlink *devlink, u32 id,
 
 	return 0;
 }
+static int
+nfp_devlink_vq_config_get(struct devlink *devlink, u32 id,
+			     struct devlink_param_gset_ctx *ctx)
+{
+	struct nfp_pf *pf = devlink_priv(devlink);
+	char num[20];
+	int i, j;
+	u8 tmp;
+
+	for (i = 0, j = NFP_NET_CFG_QUEUE_TYPE-1; j >= 0 && i < 16; j--) {
+		tmp = pf->config_vfs_queue[j];
+		num[i++] = tmp/100 + '0';
+		num[i++] = (tmp%100)/10 + '0';
+		num[i++] = tmp%10 + '0';
+
+		if (j == 0)
+			num[i++] = '\0';
+		else
+			num[i++] = '-';
+	}
+
+	strcpy(ctx->val.vstr, num);
+
+	return 0;
+}
+
+static int
+nfp_devlink_vq_config_set(struct devlink *devlink, u32 id,
+			     struct devlink_param_gset_ctx *ctx)
+{
+	struct nfp_pf *pf = devlink_priv(devlink);
+	char *value = ctx->val.vstr;
+	char num[5];
+	int i, j, t;
+	u8 config_vfs_queue[NFP_NET_CFG_QUEUE_TYPE];
+	u8 config = 0;
+	u8 tmp = 0;
+
+	memset(num, 0, sizeof(num)/sizeof(char));
+	memset(config_vfs_queue, 0, sizeof(config_vfs_queue));
+
+	for (i = 0, j = 0; value[i] != '\0'; i++) {
+		if (value[i] != '-' && (value[i] >= '0' && value[i] <= '9'))
+			num[j++] = value[i];
+
+		if (value[i] == '-' || value[i + 1] == '\0') {
+			for (t = 0; t < j; t++)
+				tmp = (num[t] - '0') + 10*tmp;
+
+			config_vfs_queue[config++] = tmp;
+			j = 0;
+			tmp = 0;
+			memset(num, 0, sizeof(num)/sizeof(char));
+		}
+	}
+
+	for (i = 0; i <  NFP_NET_CFG_QUEUE_TYPE; i++)
+		pf->config_vfs_queue[NFP_NET_CFG_QUEUE_TYPE - i - 1] = config_vfs_queue[i];
+
+	return 0;
+}
+
+
+static int
+nfp_devlink_vq_config_validate(struct devlink *devlink, u32 id,
+			      union devlink_param_value val,
+			      struct netlink_ext_ack *extack)
+{
+	char *value = val.vstr;
+	char num[5];
+	u8 config_vfs_queue[NFP_NET_CFG_QUEUE_TYPE];
+	u32 total_q_num = 0;
+	u32 config = 0;
+	u8 tmp = 0;
+	int i, j, t;
+	int err = 0;
+	extern u16 nfp_net_max_vf_queues;
+
+	memset(num, 0, sizeof(num)/sizeof(char));
+	memset(config_vfs_queue, 0, sizeof(config_vfs_queue));
+
+	for (i = 0, j = 0; value[i] != '\0'; i++) {
+		if (config >= NFP_NET_CFG_QUEUE_TYPE) {
+			err = -EOPNOTSUPP;
+			NL_SET_ERR_MSG_MOD(extack,
+				"The format is error. The format should be"
+				"16qnum-8qnum-4qnum-2qnum-1qnum," 
+				"e.g. 16-8-4-2-1 it will have 8 8q vfs," 
+				"4 4q vfs,2 2q vfs, 1 1q vf");
+			return err;
+		}
+
+		if (value[i] != '-' && (value[i] < '0' || value[i] > '9')) {
+			err = -EOPNOTSUPP;
+			NL_SET_ERR_MSG_MOD(extack,
+				"The format is error. The format"
+				"should be 16qnum-8qnum-4qnum-2qnum-1qnum,"
+				"e.g. 16-8-4-2-1 it will have 16 16q vfs," 
+				"8 8q vfs,4 4q vfs, 2 2q vfs, 1 1q vf");
+			return err;
+		}
+
+		if ((value[i] >= '0') && (value[i] <= '9'))
+			num[j++] = value[i];
+
+		if ((value[i] == '-') ^ (value[i + 1] == '\0')) {
+			for (t = 0; t < j; t++)
+				tmp = (num[t] - '0') + 10*tmp;
+
+			if (tmp > nfp_net_max_vf_queues) {
+				err = -EOPNOTSUPP;
+				NL_SET_ERR_MSG_MOD(extack, "The set q is more"
+						"than the MAX q.");
+				return err;
+			}
+
+			config_vfs_queue[config++] = tmp;
+			j = 0;
+			tmp = 0;
+			memset(num, 0, sizeof(num)/sizeof(char));
+		}
+	}
+
+	if (config != NFP_NET_CFG_QUEUE_TYPE) {
+		err = -EOPNOTSUPP;
+		NL_SET_ERR_MSG_MOD(extack,
+			"The format is error."
+			"The format should be 16qnum-8qnum-4qnum-2qnum-1qnum,"
+			"e.g. 16-8-4-2-1 it will have 16 16q vfs, 8 8q vfs," 
+			"4 4q vfs,2 2q vfs, 1 1q vf");
+		return err;
+	}
+
+	total_q_num =config_vfs_queue[0] * 16 + config_vfs_queue[1] * 8 +
+			config_vfs_queue[2] * 4 + config_vfs_queue[3] * 2
+			+ config_vfs_queue[4] * 1;
+
+	if (total_q_num > nfp_net_max_vf_queues) {
+		err = -EOPNOTSUPP;
+		NL_SET_ERR_MSG_MOD(extack, "The set q is more than the MAX q.");
+		return err;
+	}
+
+	return err;
+}
 
 static int
 nfp_devlink_vq_config_get(struct devlink *devlink, u32 id,
@@ -382,6 +528,15 @@ int nfp_devlink_params_register(struct nfp_pf *pf)
 	if (err <= 0)
 		return err;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+	err = devlink_params_register(devlink, nfp_devlink_params,
+				      ARRAY_SIZE(nfp_devlink_params));
+	if (err)
+		return err;
+
+	devlink_params_publish(devlink);
+	return 0;
+#else
 	return devlink_params_register(devlink, nfp_devlink_params,
 				       ARRAY_SIZE(nfp_devlink_params));
 #endif
